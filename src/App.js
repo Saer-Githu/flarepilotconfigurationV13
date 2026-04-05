@@ -12,7 +12,7 @@ function useFonts() {
   }, []);
 }
 
-// ─── Physics Engine (V13 - Stepped Head + Strict Fluid Dynamics Checks) ──────
+// ─── Physics Engine (V14 - Full Spark Range & 15D Mixing Rule) ───────────────
 function compute(v, isGasOn) {
   const G = 1.882,
     A = 1.204,
@@ -21,7 +21,7 @@ function compute(v, isGasOn) {
     EX = 3.8,
     CA = 0.72;
 
-  // 1. Gas Jet (Pressure drops to 0 if Valve is Closed)
+  // 1. Gas Jet
   const pPa = (isGasOn ? v.p_gas : 0) * 6894.76;
 
   const rN = v.d_noz / 1000 / 2,
@@ -47,7 +47,6 @@ function compute(v, isGasOn) {
   const vMC = mG / rg + volA;
   const vTS = aT > 0 ? vMC / aT : 0;
 
-  // Body ID is constant throughout the main body AND the top head
   const aBody = Math.PI * (v.body_id / 1000 / 2) ** 2;
   const vBS = aBody > 0 ? vMC / aBody : 0;
 
@@ -58,12 +57,17 @@ function compute(v, isGasOn) {
   const volTotM3 = volCham + volThr + volBody;
   const tRes = vMC > 0 ? (volTotM3 / vMC) * 1000 : 0;
 
-  // 5. Exit Ports (Calculated early for blowoff check)
+  // 4. Spark Location & Mixing Dynamics (NEW IN V14)
+  const req_mix_len = 15 * v.body_id; // Turbulent 15D Rule (mm)
+  const isMixedOK = v.spark_bot >= req_mix_len;
+  const t_to_spark = vBS > 0 ? (v.spark_bot / 1000 / vBS) * 1000 : 0; // ms to reach spark
+  const vol_pre_spark = aBody * (v.spark_bot / 1000) * 1e6; // cm3 of gas ignited instantly
+
+  // 5. Exit Ports & Temperatures
   const nP = Math.round(v.rows) * Math.round(v.hpr);
   const rP = v.d_port / 1000 / 2,
     aP = Math.PI * rP ** 2 * Math.max(nP, 1);
 
-  // Preliminary Flame Temp (Assume ignition to find exit velocity)
   const afr = mG > 0 ? mA / mG : 0;
   const phi = afr > 0 ? SR / afr : 0;
   let prelim_tF = v.amb_temp;
@@ -74,27 +78,25 @@ function compute(v, isGasOn) {
   const expF = prelim_tF > 300 ? EX * (prelim_tF / 1980) : 1;
   const vEx = aP > 0 ? (vMC * expF) / aP : 0;
 
-  // 6. Spark
   const vSp = vBS;
 
   // ====================================================================
-  // 4. STRICT COMBUSTION LIMITS (Chemistry + Fluid Dynamics)
+  // 6. STRICT COMBUSTION LIMITS
   // ====================================================================
   const isChemistryOK = phi >= 0.5 && phi <= 2.8;
-  const isNotFlashback = vBS > 0.4; // Body velocity must beat Propane flame speed
-  const isNotBlowoff = vEx < 18.0; // Exit velocity must not blow the flame off ports
-  const isSparkOK = vSp > 0.3 && vSp < 8.0; // Flow must be fast enough to avoid fouling, slow enough to spark
+  const isNotFlashback = vBS > 0.4;
+  const isNotBlowoff = vEx < 18.0;
+  const isSparkOK = vSp > 0.3 && vSp < 8.0;
 
-  // ALL conditions must be met for stable flame
-  const combOK = isChemistryOK && isNotFlashback && isNotBlowoff && isSparkOK;
-
-  // Final Flame Temp (Drops to ambient if physical limits cause blowout)
+  const combOK =
+    isChemistryOK && isNotFlashback && isNotBlowoff && isSparkOK && isMixedOK;
   const tF = combOK ? prelim_tF : v.amb_temp;
 
-  // Determine specific failure reason for UI tracking
   let failReason = "NONE";
   if (!isGasOn) failReason = "VALVE CLOSED";
   else if (!isChemistryOK) failReason = "POOR MIXTURE (Φ LIMIT)";
+  else if (!isMixedOK)
+    failReason = `POOR MIXING (SPARK BELOW ${req_mix_len}mm)`;
   else if (!isNotFlashback) failReason = "FLASHBACK RISK (LOW VELOCITY)";
   else if (!isNotBlowoff) failReason = "BLOWOFF RISK (HIGH EXIT VEL)";
   else if (!isSparkOK) failReason = "SPARK FAILURE (FLOW OUT OF RANGE)";
@@ -115,6 +117,10 @@ function compute(v, isGasOn) {
     vol_cm3: volTotM3 * 1e6,
     v_at_spark: vSp,
     spark_ok: isSparkOK,
+    req_mix_len,
+    is_mixed_ok: isMixedOK,
+    t_to_spark,
+    vol_pre_spark,
     ports_tot: nP,
     comb_ok: combOK,
     fail_reason: failReason,
@@ -138,6 +144,7 @@ const RANGES = {
   t_res: [10, 600],
   v_at_spark: [0.3, 8],
   vol_cm3: [10, 5000],
+  t_to_spark: [10, 600],
 };
 
 const TIER = {
@@ -168,19 +175,19 @@ function fv(v) {
 
 // ─── Default Parameters ───────────────────────────────────────────────────────
 const DEFAULTS = {
-  p_gas: 11,
+  p_gas: 15,
   d_noz: 0.8,
   cd: 0.82,
   amb_temp: 20,
-  d_thr: 14,
-  d_air_in: 8,
+  d_thr: 12,
+  d_air_in: 10.5,
   n_air_in: 2,
   m_eff: 85,
   cham_vol: 30,
   thr_len: 85,
-  body_len: 1500,
-  body_id: 46,
-  spark_bot: 100,
+  body_len: 1950,
+  body_id: 26,
+  spark_bot: 1500, // Tuned for optimal performance
   top_od: 50,
   top_len: 250,
   rows: 4,
@@ -216,12 +223,21 @@ function Diagram({ inp, out, isIgnited, isGasOn }) {
   const headY = 120;
   const headVisLen = 100;
   const headTransY = headY + headVisLen;
+  const upperBodyTop = headTransY + 15;
 
   const breakYBot = tyTop - 80,
     breakYTop = headTransY + 80;
   const midBreak = (breakYTop + breakYBot) / 2;
 
-  const spY = tyTop - (10 + (inp.spark_bot / 300) * 60);
+  // Dynamic Spark Mapping across the visual break
+  let spY = 0;
+  const sparkRatio = Math.min(1, Math.max(0, inp.spark_bot / inp.body_len));
+  if (sparkRatio <= 0.5) {
+    spY = tyTop - (sparkRatio / 0.5) * (tyTop - breakYBot);
+  } else {
+    spY = breakYTop - ((sparkRatio - 0.5) / 0.5) * (breakYTop - upperBodyTop);
+  }
+
   const flameActive = isIgnited && out.comb_ok;
 
   return (
@@ -436,9 +452,9 @@ function Diagram({ inp, out, isIgnited, isGasOn }) {
       {/* Main Body Top (Below Head Transition) */}
       <rect
         x={cx - bOD / 2}
-        y={headTransY + 15}
+        y={upperBodyTop}
         width={bOD}
-        height={breakYTop - (headTransY + 15)}
+        height={breakYTop - upperBodyTop}
         fill="url(#dMet)"
         stroke="#38bdf8"
         strokeWidth={2}
@@ -446,9 +462,11 @@ function Diagram({ inp, out, isIgnited, isGasOn }) {
 
       {/* Transition Main Body -> Stepped Head */}
       <polygon
-        points={`${cx - headOD / 2},${headTransY} ${cx - bOD / 2},${
-          headTransY + 15
-        } ${cx + bOD / 2},${headTransY + 15} ${cx + headOD / 2},${headTransY}`}
+        points={`${cx - headOD / 2},${headTransY} ${
+          cx - bOD / 2
+        },${upperBodyTop} ${cx + bOD / 2},${upperBodyTop} ${
+          cx + headOD / 2
+        },${headTransY}`}
         fill="url(#dMet)"
         stroke="#38bdf8"
         strokeWidth={2}
@@ -482,9 +500,9 @@ function Diagram({ inp, out, isIgnited, isGasOn }) {
         strokeWidth={4}
       />
 
-      {/* Spark Plug */}
+      {/* Dynamic Spark Plug */}
       <line
-        x1={cx - bOD / 2 - 40}
+        x1={cx - bOD / 2 - 35}
         y1={spY}
         x2={cx - bID / 2}
         y2={spY}
@@ -499,6 +517,16 @@ function Diagram({ inp, out, isIgnited, isGasOn }) {
         stroke={isIgnited ? "#ef4444" : "#475569"}
         strokeWidth={3}
       />
+      <text
+        x={cx - bOD / 2 - 40}
+        y={spY + 3}
+        fill="#fca5a5"
+        fontSize={11}
+        fontFamily="monospace"
+        textAnchor="end"
+      >
+        Spark: {inp.spark_bot}mm
+      </text>
       {isIgnited && !flameActive && (
         <circle
           cx={cx - 10}
@@ -654,16 +682,6 @@ function Diagram({ inp, out, isIgnited, isGasOn }) {
         OD: {inp.top_od.toFixed(1)}mm
       </text>
       <text
-        x={cx - headOD / 2 - 15}
-        y={headY + headVisLen / 2 + 5}
-        fill="#94a3b8"
-        fontSize={10}
-        fontFamily="monospace"
-        textAnchor="end"
-      >
-        L: {inp.top_len.toFixed(0)}mm
-      </text>
-      <text
         x={cx + bOD / 2 + 15}
         y={headTransY + 40}
         fill="#94a3b8"
@@ -741,7 +759,7 @@ function Slider({ label, unit, min, max, step, value, onChange, color }) {
 function doExport(inp, out, isIgnited, isGasOn) {
   const wb = XLSX.utils.book_new();
   const data = [
-    ["BiHorns Engineering - Stepped Head Pilot Simulator", ""],
+    ["BiHorns Engineering - V14 Advanced Pilot Simulator", ""],
     [""],
     ["INPUT PARAMETERS", "Value", "Unit"],
     ["Main Gas Valve", isGasOn ? "OPEN" : "CLOSED", "—"],
@@ -755,22 +773,10 @@ function doExport(inp, out, isIgnited, isGasOn) {
     ["Pilot Body Length", inp.body_len, "mm"],
     ["Stepped Head OD", inp.top_od, "mm"],
     ["Stepped Head Length", inp.top_len, "mm"],
-    ["Spark From Throat", inp.spark_bot, "mm"],
+    ["Spark Dist. From Throat", inp.spark_bot, "mm"],
     [""],
     ["CALCULATED RESULTS", "Value", "Unit", "Status"],
     ["System Ignited", isIgnited ? "YES" : "NO", "—", "—"],
-    [
-      "Gas Mass Flow",
-      out.m_gas_hr.toFixed(2),
-      "kg/hr",
-      tier("m_gas_hr", out.m_gas_hr).toUpperCase(),
-    ],
-    [
-      "Air Mass Flow",
-      out.m_air_hr.toFixed(2),
-      "kg/hr",
-      tier("m_air_hr", out.m_air_hr).toUpperCase(),
-    ],
     [
       "Equivalence Ratio (Φ)",
       out.phi.toFixed(3),
@@ -778,11 +784,25 @@ function doExport(inp, out, isIgnited, isGasOn) {
       tier("phi", out.phi).toUpperCase(),
     ],
     [
-      "Flame Temp",
-      out.t_flame.toFixed(0),
-      "°C",
-      tier("t_flame", out.t_flame).toUpperCase(),
+      "Air Mass Flow",
+      out.m_air_hr.toFixed(2),
+      "kg/hr",
+      tier("m_air_hr", out.m_air_hr).toUpperCase(),
     ],
+    ["Required Mixing Dist (15D)", out.req_mix_len.toFixed(0), "mm", "—"],
+    [
+      "Mixing State",
+      out.is_mixed_ok ? "HOMOGENEOUS" : "STRATIFIED",
+      "—",
+      out.is_mixed_ok ? "OK" : "BAD",
+    ],
+    [
+      "Time to Spark",
+      out.t_to_spark.toFixed(1),
+      "ms",
+      tier("t_to_spark", out.t_to_spark).toUpperCase(),
+    ],
+    ["Pre-Spark Ignited Volume", out.vol_pre_spark.toFixed(0), "cm³", "—"],
     [
       "Exit Velocity",
       out.v_exit.toFixed(2),
@@ -790,17 +810,10 @@ function doExport(inp, out, isIgnited, isGasOn) {
       tier("v_exit", out.v_exit).toUpperCase(),
     ],
     [
-      "Body Velocity",
-      out.v_body.toFixed(2),
-      "m/s",
-      tier("v_body", out.v_body).toUpperCase(),
-    ],
-    ["Total Internal Volume", out.vol_cm3.toFixed(0), "cm³", "—"],
-    [
-      "Residence Time",
-      out.t_res.toFixed(1),
-      "ms",
-      tier("t_res", out.t_res).toUpperCase(),
+      "Flame Temp",
+      out.t_flame.toFixed(0),
+      "°C",
+      tier("t_flame", out.t_flame).toUpperCase(),
     ],
     [
       "Ignition State",
@@ -832,9 +845,15 @@ export default function FlarePilotApp() {
     setIsGasOn(false);
   };
 
-  const resBlock = (label, val, unit, key) => {
-    const t = tier(key, val);
-    const color = TIER[t].text;
+  const resBlock = (label, val, unit, key, customColor) => {
+    let t = "n";
+    let color = "#94a3b8";
+    if (key) {
+      t = tier(key, val);
+      color = TIER[t]?.text || "#94a3b8";
+    }
+    if (customColor) color = customColor;
+
     return (
       <div
         style={{
@@ -865,7 +884,8 @@ export default function FlarePilotApp() {
             fontSize: 14,
           }}
         >
-          {fv(val)} <span style={{ fontSize: 10, opacity: 0.7 }}>{unit}</span>
+          {typeof val === "number" ? fv(val) : val}{" "}
+          <span style={{ fontSize: 10, opacity: 0.7 }}>{unit}</span>
         </span>
       </div>
     );
@@ -892,7 +912,6 @@ export default function FlarePilotApp() {
       statusColor = "#34d399";
       statusBg = "#064e3b";
     } else {
-      // Dynamic Failure Text based on Fluid Dynamics check
       statusText = out.fail_reason;
       statusColor = "#fca5a5";
       statusBg = "#7f1d1d";
@@ -911,7 +930,7 @@ export default function FlarePilotApp() {
         gap: 20,
       }}
     >
-      {/* Header with Simulator Controls */}
+      {/* Header */}
       <div
         style={{
           display: "flex",
@@ -940,7 +959,7 @@ export default function FlarePilotApp() {
               fontSize: 12,
             }}
           >
-            V13 Strict Physics Simulator
+            V14 Dynamic Spark & Mixing Simulator
           </span>
         </div>
         <div style={{ display: "flex", gap: 15 }}>
@@ -1035,6 +1054,29 @@ export default function FlarePilotApp() {
               fontFamily: "'Rajdhani',sans-serif",
               borderBottom: "1px solid #334155",
               paddingBottom: 10,
+              color: "#ef4444",
+            }}
+          >
+            SPARK PLUG PLACEMENT
+          </h3>
+          {/* Extended Spark Slider */}
+          <Slider
+            label="Spark Dist. from Throat"
+            unit="mm"
+            min={100}
+            max={1650}
+            step={10}
+            value={inp.spark_bot}
+            onChange={(v) => update("spark_bot", v)}
+            color="#ef4444"
+          />
+
+          <h3
+            style={{
+              fontFamily: "'Rajdhani',sans-serif",
+              borderBottom: "1px solid #334155",
+              paddingBottom: 10,
+              marginTop: 30,
               color: "#38bdf8",
             }}
           >
@@ -1162,58 +1204,6 @@ export default function FlarePilotApp() {
             onChange={(v) => update("top_len", v)}
             color="#10b981"
           />
-
-          <h3
-            style={{
-              fontFamily: "'Rajdhani',sans-serif",
-              borderBottom: "1px solid #334155",
-              paddingBottom: 10,
-              marginTop: 30,
-              color: "#38bdf8",
-            }}
-          >
-            PORTS & SPARK
-          </h3>
-          <Slider
-            label="Spark Dist. from Throat"
-            unit="mm"
-            min={50}
-            max={300}
-            step={5}
-            value={inp.spark_bot}
-            onChange={(v) => update("spark_bot", v)}
-            color="#ef4444"
-          />
-          <Slider
-            label="Port Rows"
-            unit=""
-            min={1}
-            max={8}
-            step={1}
-            value={inp.rows}
-            onChange={(v) => update("rows", v)}
-            color="#c084fc"
-          />
-          <Slider
-            label="Holes/Row"
-            unit=""
-            min={1}
-            max={12}
-            step={1}
-            value={inp.hpr}
-            onChange={(v) => update("hpr", v)}
-            color="#c084fc"
-          />
-          <Slider
-            label="Port Ø"
-            unit="mm"
-            min={2}
-            max={20}
-            step={0.5}
-            value={inp.d_port}
-            onChange={(v) => update("d_port", v)}
-            color="#c084fc"
-          />
         </div>
 
         {/* Center: Diagram */}
@@ -1283,11 +1273,36 @@ export default function FlarePilotApp() {
               marginBottom: 10,
             }}
           >
+            SPARK & MIXING STATE
+          </h3>
+          {resBlock(
+            "Required 15D Mix Dist",
+            out.req_mix_len,
+            "mm",
+            null,
+            "#94a3b8"
+          )}
+          {resBlock(
+            "Mixing Status",
+            out.is_mixed_ok ? "HOMOGENEOUS" : "STRATIFIED",
+            "",
+            null,
+            out.is_mixed_ok ? "#4ade80" : "#f87171"
+          )}
+          {resBlock("Time to Spark", out.t_to_spark, "ms", "t_to_spark")}
+
+          <h3
+            style={{
+              fontFamily: "'Rajdhani',sans-serif",
+              color: "#94a3b8",
+              marginTop: 20,
+              marginBottom: 10,
+            }}
+          >
             MIXING & CHEMISTRY
           </h3>
           {resBlock("Equivalence (Φ)", out.phi, "", "phi")}
           {resBlock("Air/Fuel Ratio", out.afr, ":1", "afr")}
-          {resBlock("Area Ratio", out.area_ratio, ":1", "area_ratio")}
 
           <h3
             style={{
@@ -1314,12 +1329,16 @@ export default function FlarePilotApp() {
           >
             IGNITION & EXIT
           </h3>
-          {resBlock("Internal Volume", out.vol_cm3, "cm³", "vol_cm3")}
-          {resBlock("Residence Time", out.t_res, "ms", "t_res")}
-          {resBlock("Spark Velocity", out.v_at_spark, "m/s", "v_at_spark")}
+          {resBlock("Total Internal Volume", out.vol_cm3, "cm³", "vol_cm3")}
+          {resBlock(
+            "Pre-Spark Vol Ignited",
+            out.vol_pre_spark,
+            "cm³",
+            null,
+            "#94a3b8"
+          )}
           {resBlock("Exit Velocity", out.v_exit, "m/s", "v_exit")}
           {resBlock("Flame Temp", out.t_flame, "°C", "t_flame")}
-          {resBlock("Thermal Power", out.kw, "kW", "kw")}
         </div>
       </div>
     </div>
